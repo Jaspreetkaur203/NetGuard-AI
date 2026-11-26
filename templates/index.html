@@ -11,6 +11,7 @@
 <body>
 <div class="app-shell">
 
+    <!-- SIDEBAR -->
     <aside class="sidebar">
 
         <a class="brand" href="{{ url_for('home') }}">
@@ -27,6 +28,7 @@
         <a class="nav-link" href="#upload">↑ Analyse traffic</a>
         <a class="nav-link" href="#history">◷ Analysis history</a>
         <a class="nav-link" href="#models">⌁ Model performance</a>
+        <a class="nav-link" href="#recommendations">✦ Security recommendations</a>
 
         <div class="sidebar-bottom">
             <div class="status-card">
@@ -41,6 +43,7 @@
     </aside>
 
 
+    <!-- MAIN CONTENT -->
     <main class="main-content">
 
         <header class="topbar">
@@ -61,6 +64,7 @@
         </header>
 
 
+        <!-- FLASH MESSAGES -->
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% for category, message in messages %}
                 <div class="flash {{ category }}">{{ message }}</div>
@@ -68,7 +72,9 @@
         {% endwith %}
 
 
+        <!-- HERO SECTION -->
         <section class="hero-panel">
+
             <div>
                 <span class="pill pill-blue">AI-POWERED TRAFFIC ANALYSIS</span>
 
@@ -95,9 +101,11 @@
                 <span class="node node-b">AI</span>
                 <span class="node node-c">IDS</span>
             </div>
+
         </section>
 
 
+        <!-- LATEST ANALYSIS -->
         <section class="section-heading">
             <div>
                 <p class="eyebrow">LATEST ANALYSIS</p>
@@ -112,6 +120,7 @@
 
         {% if latest %}
 
+        <!-- STATISTICS -->
         <section class="stat-grid">
 
             <article class="stat-card">
@@ -153,6 +162,7 @@
         </section>
 
 
+        <!-- ATTACK AND SEVERITY ANALYSIS -->
         <section class="two-column">
 
             <article class="panel">
@@ -180,7 +190,7 @@
 
                             <div class="bar-track">
                                 <div class="bar-fill"
-                                     style="width: {{ (count / (latest.attacks if latest.attacks else 1) * 100) }}%">
+                                    style="width: {{ (count / (latest.attacks if latest.attacks else 1) * 100) }}%">
                                 </div>
                             </div>
 
@@ -250,11 +260,145 @@
         </section>
 
 
+        <!-- NEW SECURITY RECOMMENDATIONS -->
+        <section class="panel recommendations-panel" id="recommendations">
+
+            <div class="panel-heading">
+                <div>
+                    <p class="eyebrow">SMART SECURITY GUIDANCE</p>
+                    <h3>Security Recommendations</h3>
+                </div>
+
+                <span class="pill pill-blue">RULE-BASED GUIDANCE</span>
+            </div>
+
+
+            {% if latest.attacks > 0 or latest.anomalies > 0 %}
+
+            <div class="recommendation-list">
+
+
+                {% if latest.attacks > 0 %}
+
+                <div class="recommendation-card recommendation-warning">
+
+                    <div class="recommendation-icon">!</div>
+
+                    <div>
+                        <h4>Attack Predictions Detected</h4>
+
+                        <p>
+                            {{ latest.attacks }} traffic records have
+                            been classified as potential attacks.
+                        </p>
+
+                        <ul>
+                            <li>Review the flagged traffic records.</li>
+                            <li>Verify source IP and destination details.</li>
+                            <li>Compare findings with authorised firewall logs.</li>
+                        </ul>
+                    </div>
+
+                </div>
+
+                {% endif %}
+
+
+                {% if latest.anomalies > 0 %}
+
+                <div class="recommendation-card recommendation-info">
+
+                    <div class="recommendation-icon">⌁</div>
+
+                    <div>
+                        <h4>Unusual Traffic Behaviour</h4>
+
+                        <p>
+                            {{ latest.anomalies }} records have been
+                            flagged by the anomaly detection model.
+                        </p>
+
+                        <ul>
+                            <li>Review unusual traffic patterns.</li>
+                            <li>Compare records with normal network activity.</li>
+                            <li>Check relevant network monitoring logs.</li>
+                        </ul>
+                    </div>
+
+                </div>
+
+                {% endif %}
+
+
+                {% if latest.severity_counts.get('High', 0) > 0 %}
+
+                <div class="recommendation-card recommendation-critical">
+
+                    <div class="recommendation-icon">!</div>
+
+                    <div>
+                        <h4>High Priority Review</h4>
+
+                        <p>
+                            {{ latest.severity_counts.get('High', 0) }}
+                            records have both Attack and Anomaly flags.
+                        </p>
+
+                        <ul>
+                            <li>Review these records first.</li>
+                            <li>Verify findings before taking security action.</li>
+                        </ul>
+                    </div>
+
+                </div>
+
+                {% endif %}
+
+            </div>
+
+
+            {% else %}
+
+            <div class="recommendation-card recommendation-safe">
+
+                <div class="recommendation-icon">✓</div>
+
+                <div>
+                    <h4>No Suspicious Signals Detected</h4>
+
+                    <p>
+                        No attack predictions or anomalies were
+                        recorded in this analysis.
+                    </p>
+
+                    <ul>
+                        <li>Continue regular network monitoring.</li>
+                        <li>Review new traffic data periodically.</li>
+                    </ul>
+                </div>
+
+            </div>
+
+            {% endif %}
+
+
+            <p class="recommendation-disclaimer">
+                These are automated, rule-based suggestions.
+                Model predictions are indicators for investigation,
+                not confirmation of an actual security incident.
+            </p>
+
+        </section>
+        <!-- END SECURITY RECOMMENDATIONS -->
+
+
+        <!-- REPORT DOWNLOAD -->
         <section class="panel report-actions">
 
             <div>
                 <p class="eyebrow">EXPORT RESULTS</p>
                 <h3>{{ latest.filename }}</h3>
+
                 <p class="muted small">
                     Download the full predictions CSV or summary PDF.
                 </p>
@@ -263,18 +407,19 @@
             <div class="action-row">
 
                 <a class="btn btn-secondary"
-                   href="{{ url_for('download_csv', analysis_id=latest.id) }}">
+                    href="{{ url_for('download_csv', analysis_id=latest.id) }}">
                     ↓ CSV report
                 </a>
 
                 <a class="btn btn-primary"
-                   href="{{ url_for('download_pdf', analysis_id=latest.id) }}">
+                    href="{{ url_for('download_pdf', analysis_id=latest.id) }}">
                     ↓ PDF summary
                 </a>
 
             </div>
 
         </section>
+
 
         {% else %}
 
@@ -288,6 +433,7 @@
         {% endif %}
 
 
+        <!-- ALERTS -->
         {% if alerts %}
 
         <section class="panel">
@@ -312,6 +458,7 @@
 
                     <div>
                         <b>{{ alert.Predicted_Attack_Type }}</b>
+
                         <small>
                             {{ alert.Attack_Prediction }}
                             · {{ alert.Anomaly_Status }}
@@ -337,22 +484,27 @@
         {% endif %}
 
 
+        <!-- UPLOAD SECTION -->
         <section class="section-heading" id="upload">
+
             <div>
                 <p class="eyebrow">DATA INGESTION</p>
                 <h2>Analyse a traffic dataset</h2>
             </div>
 
-            <span class="pill pill-green">CSV · Up to 100 MB application limit</span>
+            <span class="pill pill-green">
+                CSV · Up to 100 MB application limit
+            </span>
+
         </section>
 
 
         <section class="panel upload-panel">
 
             <form action="{{ url_for('predict') }}"
-                  method="POST"
-                  enctype="multipart/form-data"
-                  id="uploadForm">
+                method="POST"
+                enctype="multipart/form-data"
+                id="uploadForm">
 
                 <label class="drop-zone" for="fileInput">
 
@@ -388,8 +540,8 @@
                     </span>
 
                     <button class="btn btn-primary"
-                            type="submit"
-                            id="analyzeButton">
+                        type="submit"
+                        id="analyzeButton">
                         Analyse traffic →
                     </button>
 
@@ -400,6 +552,7 @@
         </section>
 
 
+        <!-- PREDICTION OUTPUT -->
         {% if preview %}
 
         <section class="panel" id="results">
@@ -409,6 +562,7 @@
                     <p class="eyebrow">PREDICTION OUTPUT</p>
                     <h3>First {{ preview|length }} records</h3>
                 </div>
+
                 <span class="muted tiny">Search and filter</span>
             </div>
 
@@ -416,8 +570,8 @@
             <div class="table-tools">
 
                 <input type="search"
-                       id="tableSearch"
-                       placeholder="Search this preview...">
+                    id="tableSearch"
+                    placeholder="Search this preview...">
 
                 <select id="statusFilter">
                     <option value="all">All statuses</option>
@@ -492,11 +646,14 @@
         {% endif %}
 
 
+        <!-- ANALYSIS HISTORY -->
         <section class="section-heading" id="history">
+
             <div>
                 <p class="eyebrow">AUDIT TRAIL</p>
                 <h2>Analysis history</h2>
             </div>
+
         </section>
 
 
@@ -568,11 +725,14 @@
         </section>
 
 
+        <!-- MODEL PERFORMANCE -->
         <section class="section-heading" id="models">
+
             <div>
                 <p class="eyebrow">MODEL QUALITY</p>
                 <h2>Model performance</h2>
             </div>
+
         </section>
 
 
@@ -635,10 +795,10 @@
 </div>
 
 
+<!-- JAVASCRIPT -->
 <script>
 
     const fileInput = document.getElementById("fileInput");
-
     const fileName = document.getElementById("fileName");
 
     if (fileInput) {
@@ -655,7 +815,6 @@
 
 
     const form = document.getElementById("uploadForm");
-
     const analyzeButton = document.getElementById("analyzeButton");
 
     if (form && analyzeButton) {
@@ -663,7 +822,6 @@
         form.addEventListener("submit", () => {
 
             analyzeButton.disabled = true;
-
             analyzeButton.textContent = "Analysing...";
 
         });
@@ -672,14 +830,12 @@
 
 
     const search = document.getElementById("tableSearch");
-
     const filter = document.getElementById("statusFilter");
 
 
     function filterRows() {
 
         const term = (search?.value || "").toLowerCase();
-
         const status = filter?.value || "all";
 
         document.querySelectorAll("#resultsTable tbody tr").forEach(row => {
@@ -699,7 +855,6 @@
 
 
     search?.addEventListener("input", filterRows);
-
     filter?.addEventListener("change", filterRows);
 
 </script>
