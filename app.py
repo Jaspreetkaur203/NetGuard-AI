@@ -1,96 +1,141 @@
-from __future__ import annotations
 
-import json
 import os
-import sqlite3
+import json
 import uuid
 import hmac
+import sqlite3
 import smtplib
-from contextlib import contextmanager
-from email.message import EmailMessage
-from datetime import datetime, timezone
+
 from pathlib import Path
-from typing import Any
+from io import BytesIO
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from email.message import EmailMessage
 
 import joblib
 import numpy as np
 import pandas as pd
+
 from flask import (
     Flask,
-    abort,
-    flash,
-    jsonify,
-    redirect,
     render_template,
     request,
     send_file,
-    session,
+    redirect,
     url_for,
+    flash,
+    jsonify,
+    abort
 )
-from werkzeug.security import check_password_hash, generate_password_hash
+
 from werkzeug.utils import secure_filename
 
+
+# ==========================================
+# 1. FLASK CONFIGURATION
+# ==========================================
+
 BASE_DIR = Path(__file__).resolve().parent
+
 INSTANCE_DIR = BASE_DIR / "instance"
 INSTANCE_DIR.mkdir(exist_ok=True)
 
-# Render's filesystem is temporary unless a persistent disk is attached.
-# For a demo, reports are written to /tmp; configure REPORT_DIR if needed.
-REPORT_DIR = Path(os.environ.get("REPORT_DIR", "/tmp/netguard_reports"))
+REPORT_DIR = Path(
+    os.environ.get("REPORT_DIR", "/tmp/netguard_reports")
+)
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = Path(os.environ.get("DATABASE_PATH", str(INSTANCE_DIR / "netguard_history.db")))
+
+DB_PATH = Path(
+    os.environ.get(
+        "DATABASE_PATH",
+        str(INSTANCE_DIR / "netguard_history.db")
+    )
+)
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "development-key-change-this")
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB Flask request limit
-app.config["UPLOAD_EXTENSIONS"] = {".csv"}
 
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-this-password")
-ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH")
-CHUNK_SIZE = int(os.environ.get("PREDICTION_BATCH_SIZE", "2000"))
+app.config["SECRET_KEY"] = os.environ.get(
+    "SECRET_KEY",
+    "change-this-before-production"
+)
 
-# Load the existing models and feature list from the repository root.
-try:
-    model = joblib.load(BASE_DIR / "best_model.pkl")
-    feature_columns = joblib.load(BASE_DIR / "feature_columns.pkl")
-    anomaly_model = joblib.load(BASE_DIR / "anomaly_model.pkl")
-except Exception as exc:
-    raise RuntimeError(
-        "Could not load best_model.pkl, feature_columns.pkl, or anomaly_model.pkl. "
-        "Check that all three compatible files are in the repository root."
-    ) from exc
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
-# Optional multiclass model. The current binary model alone cannot name attack types.
+CHUNK_SIZE = int(
+    os.environ.get("PREDICTION_BATCH_SIZE", "2000")
+)
+
+
+# ==========================================
+# 2. LOAD EXISTING ML MODELS
+# ==========================================
+
+model = joblib.load(
+    BASE_DIR / "best_model.pkl"
+)
+
+feature_columns = joblib.load(
+    BASE_DIR / "feature_columns.pkl"
+)
+
+anomaly_model = joblib.load(
+    BASE_DIR / "anomaly_model.pkl"
+)
+
+
+# ==========================================
+# 3. LOAD MULTICLASS MODEL
+# ==========================================
+
 multiclass_model = None
 multiclass_encoder = None
-try:
-    multiclass_path = BASE_DIR / "multiclass_model.pkl"
-    encoder_path = BASE_DIR / "multiclass_label_encoder.pkl"
-    if multiclass_path.exists() and encoder_path.exists():
-        multiclass_model = joblib.load(multiclass_path)
-        multiclass_encoder = joblib.load(encoder_path)
-except Exception:
-    app.logger.exception("Optional multiclass model could not be loaded")
 
+multiclass_path = BASE_DIR / "multiclass_model.pkl"
+encoder_path = BASE_DIR / "multiclass_label_encoder.pkl"
+
+if multiclass_path.exists() and encoder_path.exists():
+
+    multiclass_model = joblib.load(multiclass_path)
+
+    multiclass_encoder = joblib.load(encoder_path)
+
+else:
+
+    app.logger.warning(
+        "Multiclass model files are not available. "
+        "Only binary classification will be used."
+    )
+
+
+# ==========================================
+# 4. DATABASE CONNECTION
+# ==========================================
 
 @contextmanager
 def get_db():
+
     connection = sqlite3.connect(DB_PATH)
+
     connection.row_factory = sqlite3.Row
+
     try:
         yield connection
         connection.commit()
+
     except Exception:
         connection.rollback()
         raise
+
     finally:
         connection.close()
 
 
-def init_db() -> None:
+def init_db():
+
     with get_db() as connection:
+
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS analyses (
@@ -112,276 +157,487 @@ def init_db() -> None:
 init_db()
 
 
-def login_required(view):
-    from functools import wraps
+# ==========================================
+# 5. LOAD MODEL METRICS
+# ==========================================
 
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if not session.get("logged_in"):
-            return redirect(url_for("login", next=request.path))
-        return view(*args, **kwargs)
+def load_metrics():
 
-    return wrapped
+    metrics_path = BASE_DIR / "model_metrics.json"
 
-
-def load_metrics() -> dict[str, Any]:
-    path = BASE_DIR / "model_metrics.json"
-    if not path.exists():
+    if not metrics_path.exists():
         return {}
+
     try:
-        with path.open("r", encoding="utf-8") as file:
-            return json.load(file)
+
+        with open(metrics_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        return data if isinstance(data, dict) else {}
+
     except (OSError, json.JSONDecodeError):
-        app.logger.exception("Could not read model_metrics.json")
+
+        app.logger.exception("Unable to load model metrics.")
+
         return {}
 
 
-def get_probability_details(estimator, data: pd.DataFrame, predictions: np.ndarray):
-    """Return predicted-class confidence and, when possible, probability of class 1."""
-    confidence = np.full(len(data), np.nan, dtype=float)
-    attack_probability = np.full(len(data), np.nan, dtype=float)
+# ==========================================
+# 6. PREDICTION CONFIDENCE
+# ==========================================
+
+def get_confidence(estimator, X):
+
     if not hasattr(estimator, "predict_proba"):
-        return confidence, attack_probability
+
+        return [None] * len(X)
+
     try:
-        probabilities = estimator.predict_proba(data)
-        classes = list(getattr(estimator, "classes_", []))
-        if probabilities.ndim == 2 and probabilities.shape[0] == len(data):
-            confidence = np.max(probabilities, axis=1)
-            if 1 in classes:
-                attack_probability = probabilities[:, classes.index(1)]
+
+        probabilities = estimator.predict_proba(X)
+
+        confidence = np.max(probabilities, axis=1) * 100
+
+        return np.round(confidence, 2).tolist()
+
     except Exception:
-        app.logger.exception("Could not calculate model probabilities")
-    return confidence, attack_probability
+
+        app.logger.exception(
+            "Prediction confidence could not be calculated."
+        )
+
+        return [None] * len(X)
 
 
-def to_attack_type(predicted_value: Any) -> str:
-    if multiclass_encoder is not None:
-        try:
-            decoded = multiclass_encoder.inverse_transform(
-                np.asarray([int(predicted_value)], dtype=int)
-            )[0]
-            return str(decoded)
-        except Exception:
-            pass
-    return str(predicted_value)
+# ==========================================
+# 7. CONVERT MULTICLASS LABELS
+# ==========================================
+
+def decode_attack_types(predictions):
+
+    if multiclass_encoder is None:
+
+        return [str(value) for value in predictions]
+
+    try:
+
+        encoded = np.asarray(predictions, dtype=int)
+
+        decoded = multiclass_encoder.inverse_transform(
+            encoded
+        )
+
+        return [str(value) for value in decoded]
+
+    except (ValueError, TypeError, AttributeError):
+
+        app.logger.exception(
+            "Unable to decode multiclass predictions."
+        )
+
+        return [str(value) for value in predictions]
 
 
-def build_severity(is_attack: bool, is_anomaly: bool) -> str:
-    # Triage labels only; these are not a verified measure of real-world impact.
+# ==========================================
+# 8. THREAT SEVERITY
+# ==========================================
+
+def get_severity(is_attack, is_anomaly):
+
     if is_attack and is_anomaly:
         return "High"
+
     if is_attack:
         return "Medium"
+
     if is_anomaly:
         return "Low"
+
     return "Informational"
 
 
+# ==========================================
+# 9. EMAIL ALERT FUNCTION
+# ==========================================
 
-def send_email_alert(filename: str, total: int, attacks: int, anomalies: int) -> bool:
-    """Send an optional notification when SMTP settings are configured."""
-    host = os.environ.get("SMTP_HOST")
+def send_email_alert(
+    filename,
+    total,
+    attacks,
+    anomalies
+):
+
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_user = os.environ.get("SMTP_USERNAME")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
     recipient = os.environ.get("ALERT_TO_EMAIL")
-    username = os.environ.get("SMTP_USERNAME")
-    password = os.environ.get("SMTP_PASSWORD")
-    if not all([host, recipient, username, password]):
+
+    if not all([
+        smtp_host,
+        smtp_user,
+        smtp_password,
+        recipient
+    ]):
+
         return False
+
     try:
+
         message = EmailMessage()
-        message["Subject"] = f"NetGuard AI alert: {attacks} attack predictions"
-        message["From"] = username
+
+        message["Subject"] = "NetGuard AI Security Alert"
+
+        message["From"] = smtp_user
         message["To"] = recipient
+
         message.set_content(
-            "NetGuard AI completed a traffic analysis.\n\n"
-            f"File: {filename}\nTotal records: {total}\n"
-            f"Attack predictions: {attacks}\nAnomalies: {anomalies}\n\n"
-            "Please review the dashboard and verify the detections."
+            f"""
+NetGuard AI has completed network traffic analysis.
+
+File: {filename}
+
+Total Records: {total}
+
+Attack Predictions: {attacks}
+
+Detected Anomalies: {anomalies}
+
+Please review the dashboard.
+"""
         )
-        port = int(os.environ.get("SMTP_PORT", "587"))
-        with smtplib.SMTP(host, port, timeout=15) as server:
+
+        smtp_port = int(
+            os.environ.get("SMTP_PORT", "587")
+        )
+
+        with smtplib.SMTP(
+            smtp_host,
+            smtp_port,
+            timeout=15
+        ) as server:
+
             server.starttls()
-            server.login(username, password)
+
+            server.login(
+                smtp_user,
+                smtp_password
+            )
+
             server.send_message(message)
+
         return True
+
     except Exception:
-        app.logger.exception("Optional email alert could not be sent")
+
+        app.logger.exception("Email alert failed.")
+
         return False
 
 
-def analysis_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+# ==========================================
+# 10. DATABASE HISTORY HELPERS
+# ==========================================
+
+def format_analysis(row):
+
     item = dict(row)
-    item["category_counts"] = json.loads(item["category_counts"] or "{}")
-    item["severity_counts"] = json.loads(item["severity_counts"] or "{}")
+
+    item["category_counts"] = json.loads(
+        item["category_counts"] or "{}"
+    )
+
+    item["severity_counts"] = json.loads(
+        item["severity_counts"] or "{}"
+    )
+
     return item
 
 
-def dashboard_context(latest: dict[str, Any] | None = None):
+def get_history():
+
     with get_db() as connection:
+
         rows = connection.execute(
-            "SELECT * FROM analyses ORDER BY created_at DESC LIMIT 15"
+            """
+            SELECT *
+            FROM analyses
+            ORDER BY created_at DESC
+            LIMIT 50
+            """
         ).fetchall()
-    history = [analysis_to_dict(row) for row in rows]
-    metrics = load_metrics()
-    return {
-        "latest": latest,
-        "history": history,
-        "metrics": metrics,
-        "multiclass_ready": multiclass_model is not None,
-    }
+
+    return [
+        format_analysis(row)
+        for row in rows
+    ]
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if session.get("logged_in"):
-        return redirect(url_for("home"))
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        password_ok = (
-            check_password_hash(ADMIN_PASSWORD_HASH, password)
-            if ADMIN_PASSWORD_HASH
-            else password == ADMIN_PASSWORD
-        )
-        if username == ADMIN_USERNAME and password_ok:
-            session.clear()
-            session["logged_in"] = True
-            session["username"] = username
-            return redirect(request.args.get("next") or url_for("home"))
-        flash("Incorrect username or password.", "error")
-    return render_template("login.html")
-
-
-@app.route("/logout", methods=["POST"])
-@login_required
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
+# ==========================================
+# 11. HOME DASHBOARD
+# ==========================================
 
 @app.route("/")
-@login_required
 def home():
-    latest = None
-    with get_db() as connection:
-        row = connection.execute(
-            "SELECT * FROM analyses ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-    if row:
-        latest = analysis_to_dict(row)
-    return render_template("index.html", **dashboard_context(latest))
 
+    history = get_history()
+
+    latest = history[0] if history else None
+
+    return render_template(
+        "index.html",
+        latest=latest,
+        history=history,
+        metrics=load_metrics(),
+        multiclass_ready=(
+            multiclass_model is not None
+        ),
+        preview=[],
+        alerts=[]
+    )
+
+
+# ==========================================
+# 12. CSV UPLOAD AND ANALYSIS
+# ==========================================
 
 @app.route("/predict", methods=["POST"])
-@login_required
 def predict():
+
     uploaded_file = request.files.get("file")
-    if uploaded_file is None or uploaded_file.filename == "":
-        flash("Please choose a CSV file first.", "error")
+
+    if uploaded_file is None or not uploaded_file.filename:
+
+        flash("Please select a CSV file.", "error")
+
         return redirect(url_for("home"))
 
-    original_name = secure_filename(uploaded_file.filename)
-    if Path(original_name).suffix.lower() not in app.config["UPLOAD_EXTENSIONS"]:
-        flash("Only CSV files are supported.", "error")
+    filename = secure_filename(
+        uploaded_file.filename
+    )
+
+    if Path(filename).suffix.lower() != ".csv":
+
+        flash("Please upload a CSV file only.", "error")
+
         return redirect(url_for("home"))
 
     analysis_id = uuid.uuid4().hex
-    output_path = REPORT_DIR / f"{analysis_id}_predictions.csv"
-    totals = {"total": 0, "attacks": 0, "normal": 0, "anomalies": 0}
-    category_counts: dict[str, int] = {}
+
+    output_path = (
+        REPORT_DIR / f"{analysis_id}_predictions.csv"
+    )
+
+    totals = {
+        "total": 0,
+        "attacks": 0,
+        "normal": 0,
+        "anomalies": 0
+    }
+
+    category_counts = {}
+
     severity_counts = {
         "High": 0,
         "Medium": 0,
         "Low": 0,
-        "Informational": 0,
+        "Informational": 0
     }
-    preview: list[dict[str, Any]] = []
+
+    preview = []
+
     first_chunk = True
 
     try:
-        uploaded_file.stream.seek(0)
-        chunks = pd.read_csv(uploaded_file.stream, chunksize=CHUNK_SIZE)
+
+        chunks = pd.read_csv(
+            uploaded_file.stream,
+            chunksize=CHUNK_SIZE
+        )
+
         for chunk in chunks:
+
             if chunk.empty:
                 continue
 
-            missing = [column for column in feature_columns if column not in chunk.columns]
-            if missing:
-                raise ValueError(
-                    f"CSV is missing {len(missing)} required model features. "
-                    f"Example missing columns: {', '.join(missing[:5])}"
-                )
+            # Check required features
 
-            X = chunk[list(feature_columns)].apply(pd.to_numeric, errors="coerce")
-            X.replace([np.inf, -np.inf], np.nan, inplace=True)
-            if X.isnull().any().any():
-                raise ValueError(
-                    "CSV contains missing or non-numeric values in required feature columns. "
-                    "Clean those values before uploading."
-                )
-
-            binary_predictions = np.asarray(model.predict(X))
-            anomaly_predictions = np.asarray(anomaly_model.predict(X))
-            confidence, _ = get_probability_details(model, X, binary_predictions)
-
-            is_attack_values = binary_predictions == 1
-            is_anomaly_values = anomaly_predictions == -1
-
-            if multiclass_model is not None:
-                raw_types = np.asarray(multiclass_model.predict(X))
-                predicted_types = [to_attack_type(value) for value in raw_types]
-            else:
-                predicted_types = ["Not configured"] * len(chunk)
-
-            attack_labels = ["Attack" if value else "Normal" for value in is_attack_values]
-            anomaly_labels = ["Anomaly" if value else "Normal" for value in is_anomaly_values]
-            severities = [
-                build_severity(bool(attack), bool(anomaly))
-                for attack, anomaly in zip(is_attack_values, is_anomaly_values)
+            missing = [
+                column
+                for column in feature_columns
+                if column not in chunk.columns
             ]
 
-            # Only show a named attack category when the binary classifier also flags an attack.
+            if missing:
+
+                raise ValueError(
+                    f"Missing {len(missing)} required columns. "
+                    f"Examples: {', '.join(missing[:5])}"
+                )
+
+            # Prepare numerical input
+
+            X = chunk[list(feature_columns)].apply(
+                pd.to_numeric,
+                errors="coerce"
+            )
+
+            X.replace(
+                [np.inf, -np.inf],
+                np.nan,
+                inplace=True
+            )
+
+            if X.isnull().any().any():
+
+                raise ValueError(
+                    "CSV contains missing or invalid feature values."
+                )
+
+            # Binary attack prediction
+
+            binary_predictions = np.asarray(
+                model.predict(X)
+            )
+
+            # Anomaly detection
+
+            anomaly_predictions = np.asarray(
+                anomaly_model.predict(X)
+            )
+
+            # Prediction confidence
+
+            confidence = get_confidence(
+                model,
+                X
+            )
+
+            is_attack = binary_predictions == 1
+
+            is_anomaly = anomaly_predictions == -1
+
+            # Multiclass attack prediction
+
+            if multiclass_model is not None:
+
+                raw_types = multiclass_model.predict(X)
+
+                decoded_types = decode_attack_types(
+                    raw_types
+                )
+
+            else:
+
+                decoded_types = [
+                    "Not configured"
+                ] * len(chunk)
+
+            # Readable output labels
+
+            attack_labels = [
+                "Attack" if value else "Normal"
+                for value in is_attack
+            ]
+
+            anomaly_labels = [
+                "Anomaly" if value else "Normal"
+                for value in is_anomaly
+            ]
+
             final_types = []
-            for is_attack, predicted_type in zip(is_attack_values, predicted_types):
-                if not is_attack:
+
+            for attack, category in zip(
+                is_attack,
+                decoded_types
+            ):
+
+                if not attack:
+
                     final_types.append("BENIGN / Normal")
+
                 elif multiclass_model is None:
-                    final_types.append("Train multiclass model to identify type")
+
+                    final_types.append(
+                        "Multiclass model not configured"
+                    )
+
                 else:
-                    final_types.append(predicted_type)
+
+                    final_types.append(category)
+
+            severities = [
+                get_severity(
+                    bool(attack),
+                    bool(anomaly)
+                )
+                for attack, anomaly in zip(
+                    is_attack,
+                    is_anomaly
+                )
+            ]
+
+            # Add prediction results
 
             result_chunk = chunk.copy()
+
             result_chunk["Attack_Prediction"] = attack_labels
+
             result_chunk["Anomaly_Status"] = anomaly_labels
+
             result_chunk["Predicted_Attack_Type"] = final_types
-            result_chunk["Prediction_Confidence_Percent"] = np.where(
-                np.isnan(confidence), "Not available", np.round(confidence * 100, 2)
-            )
+
+            result_chunk["Prediction_Confidence_Percent"] = confidence
+
             result_chunk["Threat_Severity"] = severities
+
+            # Write output CSV in batches
 
             result_chunk.to_csv(
                 output_path,
                 index=False,
                 mode="w" if first_chunk else "a",
-                header=first_chunk,
+                header=first_chunk
             )
+
             first_chunk = False
 
+            # Update dashboard statistics
+
             count = len(result_chunk)
-            attack_count = int(np.sum(is_attack_values))
-            anomaly_count = int(np.sum(is_anomaly_values))
+
+            attack_count = int(np.sum(is_attack))
+
+            anomaly_count = int(np.sum(is_anomaly))
+
             totals["total"] += count
+
             totals["attacks"] += attack_count
+
             totals["normal"] += count - attack_count
+
             totals["anomalies"] += anomaly_count
 
-            for category, is_attack in zip(final_types, is_attack_values):
-                if is_attack:
-                    category_counts[category] = category_counts.get(category, 0) + 1
+            for category, attack in zip(
+                final_types,
+                is_attack
+            ):
+
+                if attack:
+
+                    category_counts[category] = (
+                        category_counts.get(category, 0) + 1
+                    )
+
             for severity in severities:
+
                 severity_counts[severity] += 1
 
-            if len(preview) < 100:
-                remaining = 100 - len(preview)
+            # First 100 rows for preview
+
+            remaining = 100 - len(preview)
+
+            if remaining > 0:
+
                 preview.extend(
                     result_chunk[
                         [
@@ -389,266 +645,667 @@ def predict():
                             "Anomaly_Status",
                             "Predicted_Attack_Type",
                             "Prediction_Confidence_Percent",
-                            "Threat_Severity",
+                            "Threat_Severity"
                         ]
-                    ].head(remaining).to_dict(orient="records")
+                    ].head(remaining).to_dict(
+                        orient="records"
+                    )
                 )
 
         if first_chunk or totals["total"] == 0:
-            raise ValueError("The CSV file contains no data rows.")
 
-        created_at = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            raise ValueError(
+                "The uploaded CSV contains no data."
+            )
+
+        # Save analysis history
+
+        created_at = (
+            datetime.now(timezone.utc)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M:%S %Z")
+        )
+
         with get_db() as connection:
+
             connection.execute(
                 """
-                INSERT INTO analyses
-                (id, created_at, filename, total, attacks, normal, anomalies,
-                 category_counts, severity_counts, csv_path)
+                INSERT INTO analyses (
+                    id,
+                    created_at,
+                    filename,
+                    total,
+                    attacks,
+                    normal,
+                    anomalies,
+                    category_counts,
+                    severity_counts,
+                    csv_path
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     analysis_id,
                     created_at,
-                    original_name,
+                    filename,
                     totals["total"],
                     totals["attacks"],
                     totals["normal"],
                     totals["anomalies"],
                     json.dumps(category_counts),
                     json.dumps(severity_counts),
-                    str(output_path),
-                ),
+                    str(output_path)
+                )
             )
 
-        email_alert_sent = False
+        # Send optional email alert
+
+        email_sent = False
+
         if totals["attacks"] > 0 or totals["anomalies"] > 0:
-            email_alert_sent = send_email_alert(
-                original_name, totals["total"], totals["attacks"], totals["anomalies"]
+
+            email_sent = send_email_alert(
+                filename,
+                totals["total"],
+                totals["attacks"],
+                totals["anomalies"]
             )
 
         latest = {
             "id": analysis_id,
-            "email_alert_sent": email_alert_sent,
             "created_at": created_at,
-            "filename": original_name,
+            "filename": filename,
             **totals,
             "category_counts": category_counts,
             "severity_counts": severity_counts,
+            "email_alert_sent": email_sent
         }
+
         alerts = [
-            row for row in preview
-            if row["Attack_Prediction"] == "Attack" or row["Anomaly_Status"] == "Anomaly"
-        ][:8]
+            row
+            for row in preview
+            if (
+                row["Attack_Prediction"] == "Attack"
+                or row["Anomaly_Status"] == "Anomaly"
+            )
+        ][:10]
+
         return render_template(
             "index.html",
-            **dashboard_context(latest),
+            latest=latest,
+            history=get_history(),
+            metrics=load_metrics(),
+            multiclass_ready=(
+                multiclass_model is not None
+            ),
             preview=preview,
-            alerts=alerts,
+            alerts=alerts
         )
 
-    except Exception as exc:
+    except Exception as error:
+
         if output_path.exists():
+
             output_path.unlink(missing_ok=True)
-        app.logger.exception("Network traffic CSV processing failed")
-        flash(f"Could not analyse this CSV: {exc}", "error")
+
+        app.logger.exception(
+            "CSV analysis failed."
+        )
+
+        flash(
+            f"Analysis failed: {error}",
+            "error"
+        )
+
         return redirect(url_for("home"))
 
 
+# ==========================================
+# 13. HISTORY PAGE
+# ==========================================
 
-@app.route("/api/analyse-flow", methods=["POST"])
-def analyse_flow_api():
-    """Accept pre-extracted, authorised network-flow features from a trusted collector."""
-    expected_key = os.environ.get("DEVICE_API_KEY")
-    if not expected_key:
-        return jsonify({"error": "Device API is not enabled on this deployment."}), 503
-    supplied_header = request.headers.get("Authorization", "")
-    supplied_key = supplied_header.removeprefix("Bearer ").strip()
-    if not hmac.compare_digest(supplied_key, expected_key):
-        return jsonify({"error": "Unauthorised."}), 401
+@app.route("/history")
+def history():
 
-    payload = request.get_json(silent=True)
-    if isinstance(payload, dict) and isinstance(payload.get("flows"), list):
-        rows = payload["flows"]
-    elif isinstance(payload, list):
-        rows = payload
-    else:
-        return jsonify({"error": "Send JSON as a list of flow objects or {flows: [...]} ."}), 400
-    if not rows or len(rows) > 2000:
-        return jsonify({"error": "Provide between 1 and 2,000 flow records per request."}), 400
-
-    try:
-        frame = pd.DataFrame(rows)
-        missing = [column for column in feature_columns if column not in frame.columns]
-        if missing:
-            return jsonify({"error": "Missing required model features.", "missing_count": len(missing), "examples": missing[:5]}), 400
-        X = frame[list(feature_columns)].apply(pd.to_numeric, errors="coerce")
-        X.replace([np.inf, -np.inf], np.nan, inplace=True)
-        if X.isnull().any().any():
-            return jsonify({"error": "Flow data has missing or non-numeric required features."}), 400
-
-        binary = np.asarray(model.predict(X))
-        anomaly = np.asarray(anomaly_model.predict(X))
-        confidence, _ = get_probability_details(model, X, binary)
-        if multiclass_model is not None:
-            category_values = [to_attack_type(value) for value in multiclass_model.predict(X)]
-        else:
-            category_values = ["Not configured"] * len(frame)
-
-        results = []
-        for index in range(len(frame)):
-            is_attack = bool(binary[index] == 1)
-            is_anomaly = bool(anomaly[index] == -1)
-            category = category_values[index] if is_attack else "BENIGN / Normal"
-            results.append({
-                "prediction": "Attack" if is_attack else "Normal",
-                "anomaly": "Anomaly" if is_anomaly else "Normal",
-                "predicted_attack_type": category,
-                "confidence_percent": None if np.isnan(confidence[index]) else round(float(confidence[index]) * 100, 2),
-                "severity": build_severity(is_attack, is_anomaly),
-            })
-        return jsonify({"results": results, "records_processed": len(results)})
-    except Exception:
-        app.logger.exception("Device flow API processing failed")
-        return jsonify({"error": "Could not process the supplied flow data."}), 500
-
-
-@app.route("/history/<analysis_id>")
-@login_required
-def history_detail(analysis_id: str):
-    with get_db() as connection:
-        row = connection.execute(
-            "SELECT * FROM analyses WHERE id = ?", (analysis_id,)
-        ).fetchone()
-    if row is None:
-        abort(404)
-    latest = analysis_to_dict(row)
-    return render_template("index.html", **dashboard_context(latest))
-
-
-@app.route("/download/<analysis_id>")
-@login_required
-def download_csv(analysis_id: str):
-    with get_db() as connection:
-        row = connection.execute(
-            "SELECT filename, csv_path FROM analyses WHERE id = ?", (analysis_id,)
-        ).fetchone()
-    if row is None:
-        abort(404)
-    path = Path(row["csv_path"])
-    if not path.exists():
-        flash("This report file is no longer available. Render storage may have restarted.", "error")
-        return redirect(url_for("home"))
-    return send_file(
-        path,
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name=f"NetGuard_{Path(row['filename']).stem}_predictions.csv",
+    return render_template(
+        "index.html",
+        latest=None,
+        history=get_history(),
+        metrics=load_metrics(),
+        multiclass_ready=(
+            multiclass_model is not None
+        ),
+        preview=[],
+        alerts=[],
+        show_history=True
     )
 
 
+# ==========================================
+# 14. DOWNLOAD CSV REPORT
+# ==========================================
+
+@app.route("/download/<analysis_id>")
+def download_csv(analysis_id):
+
+    with get_db() as connection:
+
+        row = connection.execute(
+            """
+            SELECT filename, csv_path
+            FROM analyses
+            WHERE id = ?
+            """,
+            (analysis_id,)
+        ).fetchone()
+
+    if row is None:
+
+        abort(404)
+
+    report_path = Path(row["csv_path"])
+
+    if not report_path.exists():
+
+        flash(
+            "Report is no longer available on server storage.",
+            "error"
+        )
+
+        return redirect(url_for("home"))
+
+    download_name = (
+        f"NetGuard_{Path(row['filename']).stem}_predictions.csv"
+    )
+
+    return send_file(
+        report_path,
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=download_name
+    )
+
+
+# ==========================================
+# 15. GENERATE PDF REPORT
+# ==========================================
+
 @app.route("/report/<analysis_id>.pdf")
-@login_required
-def download_pdf(analysis_id: str):
+def download_pdf(analysis_id):
+
     try:
+
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet
         from reportlab.lib.units import mm
-        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Paragraph,
+            Spacer,
+            Table,
+            TableStyle
+        )
+
     except ImportError:
-        flash("PDF support is missing. Add reportlab to requirements.txt and redeploy.", "error")
+
+        flash(
+            "PDF library is not installed.",
+            "error"
+        )
+
         return redirect(url_for("home"))
 
     with get_db() as connection:
+
         row = connection.execute(
-            "SELECT * FROM analyses WHERE id = ?", (analysis_id,)
+            """
+            SELECT *
+            FROM analyses
+            WHERE id = ?
+            """,
+            (analysis_id,)
         ).fetchone()
+
     if row is None:
+
         abort(404)
-    item = analysis_to_dict(row)
 
-    buffer = __import__("io").BytesIO()
+    item = format_analysis(row)
+
+    buffer = BytesIO()
+
     document = SimpleDocTemplate(
-        buffer, pagesize=A4, rightMargin=18 * mm, leftMargin=18 * mm,
-        topMargin=18 * mm, bottomMargin=18 * mm,
+        buffer,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm
     )
+
     styles = getSampleStyleSheet()
+
     elements = [
-        Paragraph("NetGuard AI – Network Security Analysis", styles["Title"]),
-        Spacer(1, 5 * mm),
-        Paragraph(f"File: {item['filename']}", styles["Normal"]),
-        Paragraph(f"Analysis time: {item['created_at']}", styles["Normal"]),
-        Spacer(1, 5 * mm),
-    ]
-    summary_data = [
-        ["Metric", "Result"],
-        ["Total records", str(item["total"])],
-        ["Attack predictions", str(item["attacks"])],
-        ["Normal predictions", str(item["normal"])],
-        ["Anomalies", str(item["anomalies"])],
-    ]
-    summary_table = Table(summary_data, colWidths=[85 * mm, 75 * mm])
-    summary_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#172554")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
-        ("PADDING", (0, 0), (-1, -1), 7),
-    ]))
-    elements.extend([Paragraph("Analysis summary", styles["Heading2"]), summary_table, Spacer(1, 5 * mm)])
 
-    category_data = [["Predicted attack category", "Count"]]
-    category_data.extend([[key, str(value)] for key, value in sorted(item["category_counts"].items())])
-    if len(category_data) == 1:
-        category_data.append(["No attack categories recorded", "0"])
-    category_table = Table(category_data, colWidths=[110 * mm, 50 * mm])
-    category_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#172554")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
-        ("PADDING", (0, 0), (-1, -1), 7),
-    ]))
-    elements.extend([Paragraph("Attack category summary", styles["Heading2"]), category_table, Spacer(1, 5 * mm)])
-
-    severity_data = [["Triage level", "Records"]]
-    severity_data.extend([[key, str(value)] for key, value in item["severity_counts"].items()])
-    severity_table = Table(severity_data, colWidths=[110 * mm, 50 * mm])
-    severity_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#172554")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
-        ("PADDING", (0, 0), (-1, -1), 7),
-    ]))
-    elements.extend([
-        Paragraph("Threat triage summary", styles["Heading2"]),
-        severity_table,
-        Spacer(1, 6 * mm),
         Paragraph(
-            "Note: Attack labels, confidence values and severity levels are model outputs for triage. "
-            "They are not proof of malicious activity. Review alerts before taking action.",
-            styles["Italic"],
+            "NetGuard AI - Security Analysis Report",
+            styles["Title"]
         ),
+
+        Spacer(1, 5 * mm),
+
+        Paragraph(
+            f"File: {item['filename']}",
+            styles["Normal"]
+        ),
+
+        Paragraph(
+            f"Analysis Date: {item['created_at']}",
+            styles["Normal"]
+        ),
+
+        Spacer(1, 5 * mm)
+
+    ]
+
+    summary = [
+
+        ["Metric", "Count"],
+
+        ["Total Records", str(item["total"])],
+
+        ["Attack Predictions", str(item["attacks"])],
+
+        ["Normal Predictions", str(item["normal"])],
+
+        ["Anomalies", str(item["anomalies"])]
+
+    ]
+
+    table = Table(
+        summary,
+        colWidths=[90 * mm, 65 * mm]
+    )
+
+    table.setStyle(
+        TableStyle([
+
+            (
+                "BACKGROUND",
+                (0, 0),
+                (-1, 0),
+                colors.HexColor("#172554")
+            ),
+
+            (
+                "TEXTCOLOR",
+                (0, 0),
+                (-1, 0),
+                colors.white
+            ),
+
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.5,
+                colors.grey
+            ),
+
+            (
+                "PADDING",
+                (0, 0),
+                (-1, -1),
+                8
+            )
+
+        ])
+    )
+
+    elements.extend([
+
+        Paragraph(
+            "Analysis Summary",
+            styles["Heading2"]
+        ),
+
+        table,
+
+        Spacer(1, 6 * mm)
+
     ])
+
+    categories = [
+        ["Attack Category", "Count"]
+    ]
+
+    categories.extend([
+
+        [name, str(count)]
+
+        for name, count in item["category_counts"].items()
+
+    ])
+
+    if len(categories) == 1:
+
+        categories.append([
+            "No categories available",
+            "0"
+        ])
+
+    category_table = Table(
+        categories,
+        colWidths=[90 * mm, 65 * mm]
+    )
+
+    category_table.setStyle(
+        TableStyle([
+
+            (
+                "BACKGROUND",
+                (0, 0),
+                (-1, 0),
+                colors.HexColor("#172554")
+            ),
+
+            (
+                "TEXTCOLOR",
+                (0, 0),
+                (-1, 0),
+                colors.white
+            ),
+
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.5,
+                colors.grey
+            ),
+
+            (
+                "PADDING",
+                (0, 0),
+                (-1, -1),
+                8
+            )
+
+        ])
+    )
+
+    elements.extend([
+
+        Paragraph(
+            "Attack Category Distribution",
+            styles["Heading2"]
+        ),
+
+        category_table,
+
+        Spacer(1, 6 * mm)
+
+    ])
+
+    severity_rows = [
+        ["Severity", "Count"]
+    ]
+
+    severity_rows.extend([
+
+        [name, str(count)]
+
+        for name, count in item["severity_counts"].items()
+
+    ])
+
+    severity_table = Table(
+        severity_rows,
+        colWidths=[90 * mm, 65 * mm]
+    )
+
+    severity_table.setStyle(
+        TableStyle([
+
+            (
+                "BACKGROUND",
+                (0, 0),
+                (-1, 0),
+                colors.HexColor("#172554")
+            ),
+
+            (
+                "TEXTCOLOR",
+                (0, 0),
+                (-1, 0),
+                colors.white
+            ),
+
+            (
+                "GRID",
+                (0, 0),
+                (-1, -1),
+                0.5,
+                colors.grey
+            ),
+
+            (
+                "PADDING",
+                (0, 0),
+                (-1, -1),
+                8
+            )
+
+        ])
+    )
+
+    elements.extend([
+
+        Paragraph(
+            "Threat Severity Summary",
+            styles["Heading2"]
+        ),
+
+        severity_table,
+
+        Spacer(1, 6 * mm),
+
+        Paragraph(
+            "Note: Machine learning predictions are indicators "
+            "for investigation, not proof of an attack. "
+            "Severity levels are triage labels and should "
+            "be reviewed by an administrator.",
+            styles["Italic"]
+        )
+
+    ])
+
     document.build(elements)
+
     buffer.seek(0)
+
     return send_file(
         buffer,
         mimetype="application/pdf",
         as_attachment=True,
-        download_name=f"NetGuard_{analysis_id[:8]}_report.pdf",
+        download_name=(
+            f"NetGuard_Report_{analysis_id[:8]}.pdf"
+        )
     )
 
 
+# ==========================================
+# 16. AUTHORISED DEVICE DATA API
+# ==========================================
+
+@app.route("/api/analyse-flow", methods=["POST"])
+def analyse_flow_api():
+
+    expected_key = os.environ.get("DEVICE_API_KEY")
+
+    if not expected_key:
+
+        return jsonify({
+            "error": "Device API is not enabled."
+        }), 503
+
+    auth_header = request.headers.get(
+        "Authorization", ""
+    )
+
+    supplied_key = auth_header.removeprefix(
+        "Bearer "
+    ).strip()
+
+    if not hmac.compare_digest(
+        supplied_key,
+        expected_key
+    ):
+
+        return jsonify({
+            "error": "Unauthorised request."
+        }), 401
+
+    payload = request.get_json(silent=True)
+
+    if isinstance(payload, dict):
+
+        rows = payload.get("flows")
+
+    elif isinstance(payload, list):
+
+        rows = payload
+
+    else:
+
+        rows = None
+
+    if not isinstance(rows, list) or not rows or len(rows) > 2000:
+
+        return jsonify({
+            "error": "Send between 1 and 2000 flow records."
+        }), 400
+
+    try:
+
+        frame = pd.DataFrame(rows)
+
+        missing = [
+            column
+            for column in feature_columns
+            if column not in frame.columns
+        ]
+
+        if missing:
+
+            return jsonify({
+                "error": "Required features are missing.",
+                "missing_count": len(missing),
+                "examples": missing[:5]
+            }), 400
+
+        X = frame[list(feature_columns)].apply(
+            pd.to_numeric,
+            errors="coerce"
+        )
+
+        X.replace(
+            [np.inf, -np.inf],
+            np.nan,
+            inplace=True
+        )
+
+        if X.isnull().any().any():
+
+            return jsonify({
+                "error": "Invalid or missing feature values."
+            }), 400
+
+        binary_predictions = model.predict(X)
+
+        anomaly_predictions = anomaly_model.predict(X)
+
+        confidence = get_confidence(model, X)
+
+        if multiclass_model is not None:
+
+            categories = decode_attack_types(
+                multiclass_model.predict(X)
+            )
+
+        else:
+
+            categories = [
+                "Not configured"
+            ] * len(X)
+
+        results = []
+
+        for i in range(len(X)):
+
+            attack = bool(binary_predictions[i] == 1)
+
+            anomaly = bool(anomaly_predictions[i] == -1)
+
+            results.append({
+
+                "prediction": (
+                    "Attack" if attack else "Normal"
+                ),
+
+                "anomaly": (
+                    "Anomaly" if anomaly else "Normal"
+                ),
+
+                "predicted_attack_type": (
+                    categories[i] if attack else "BENIGN / Normal"
+                ),
+
+                "confidence_percent": confidence[i],
+
+                "severity": get_severity(
+                    attack,
+                    anomaly
+                )
+
+            })
+
+        return jsonify({
+            "records_processed": len(results),
+            "results": results
+        })
+
+    except Exception:
+
+        app.logger.exception(
+            "Device flow analysis failed."
+        )
+
+        return jsonify({
+            "error": "Unable to analyse flow data."
+        }), 500
+
+
+# ==========================================
+# 17. UPLOAD SIZE ERROR
+# ==========================================
+
 @app.errorhandler(413)
-def file_too_large(_error):
-    flash("File is larger than this app's 100 MB upload limit.", "error")
-    return redirect(url_for("home")), 413
+def file_too_large(error):
+
+    return (
+        "File exceeds the 100 MB application upload limit.",
+        413
+    )
 
 
-@app.errorhandler(500)
-def internal_error(_error):
-    app.logger.exception("Unexpected server error")
-    return "An unexpected server error occurred. Check the Render runtime logs.", 500
-
+# ==========================================
+# 18. RUN APPLICATION
+# ==========================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=False
+    )
