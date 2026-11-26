@@ -7,7 +7,7 @@ import os
 from io import BytesIO
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
 model = joblib.load("best_model.pkl")
 feature_columns = joblib.load("feature_columns.pkl")
