@@ -1,0 +1,14 @@
+{
+  "multiclass": {
+    "accuracy": 0.9991833401388321,
+    "precision_weighted": 0.9991848927241195,
+    "recall_weighted": 0.9991833401388321,
+    "f1_weighted": 0.9991834150777567,
+    "classes": [
+      "BENIGN",
+      "DDoS",
+      "PortScan"
+    ],
+    "test_records": 4898
+  }
+}
